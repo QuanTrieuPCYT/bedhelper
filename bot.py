@@ -259,21 +259,23 @@ async def _prune_compose_images() -> tuple[str, str]:
     if not isinstance(project_name, str) or not project_name.strip():
         raise HostCommandError("Docker Compose configuration did not include a project name.")
 
-    image_repositories: set[str] = set()
+    image_references: set[str] = set()
     services = config.get("services", {}) if isinstance(config, dict) else {}
     if isinstance(services, dict):
-        for service in services.values():
-            if isinstance(service, dict) and isinstance(service.get("image"), str):
-                image_repositories.add(
-                    _normalize_image_repository(service["image"])
-                )
+        for service_name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            if isinstance(service.get("image"), str) and service["image"].strip():
+                image_references.add(service["image"].strip())
+            elif "build" in service:
+                image_references.add(f"{project_name}-{service_name}")
 
-    matched_ids = await _dangling_image_ids_for_compose(
-        project_name, image_repositories
+    matched_images = await _old_image_targets_for_compose(
+        project_name, image_references
     )
     outputs: list[str] = []
-    for offset in range(0, len(matched_ids), 50):
-        image_ids = matched_ids[offset : offset + 50]
+    for offset in range(0, len(matched_images), 50):
+        images = matched_images[offset : offset + 50]
         remove_command = [
             "docker",
             "--host",
@@ -281,13 +283,13 @@ async def _prune_compose_images() -> tuple[str, str]:
             "image",
             "rm",
             "--no-prune",
-            *image_ids,
+            *images,
         ]
         try:
             removal_output = await _run_docker_command(remove_command)
             outputs.append(
                 removal_output
-                or f"Removed {len(image_ids)} matching dangling image(s)."
+                or f"Removed {len(images)} old image reference(s)."
             )
         except HostCommandError as exc:
             outputs.append(
@@ -296,7 +298,7 @@ async def _prune_compose_images() -> tuple[str, str]:
 
     if not outputs:
         outputs.append(
-            "No dangling images matched this Compose project or its configured image repositories."
+            "No unused old images matched this Compose project or its configured image repositories."
         )
 
     return project_name, "\n".join(output for output in outputs if output)
@@ -323,28 +325,57 @@ def _normalize_image_repository(reference: str) -> str:
     return "/".join(parts)
 
 
-async def _dangling_image_ids_for_compose(
+async def _old_image_targets_for_compose(
     project_name: str,
-    image_repositories: set[str],
+    image_references: set[str],
 ) -> list[str]:
-    list_output = await _run_docker_command(
-        [
-            "docker",
-            "--host",
-            DOCKER_SOCKET,
-            "image",
-            "ls",
-            "--quiet",
-            "--no-trunc",
-            "--filter",
-            "dangling=true",
-        ],
+    docker_command = ["docker", "--host", DOCKER_SOCKET]
+    image_repositories = {
+        _normalize_image_repository(reference) for reference in image_references
+    }
+    protected_ids: set[str] = set()
+    references = sorted(image_references)
+    for offset in range(0, len(references), 50):
+        # Resolve exact configured tags/digests so pruning also works before a restart.
+        # If resolution fails, stop before removing anything.
+        output = await _run_docker_command(
+            docker_command
+            + [
+                "image", "inspect", "--format", "{{.Id}}",
+                *references[offset : offset + 50],
+            ],
+            timeout=DOCKER_PRESENCE_TIMEOUT_SECONDS,
+        )
+        protected_ids.update(line.strip() for line in output.splitlines() if line.strip())
+
+    container_output = await _run_docker_command(
+        docker_command + ["container", "ls", "--all", "--quiet"],
         timeout=DOCKER_PRESENCE_TIMEOUT_SECONDS,
     )
-    dangling_ids = [line.strip() for line in list_output.splitlines() if line.strip()]
-    matching_ids: list[str] = []
-    for offset in range(0, len(dangling_ids), 50):
-        image_ids = dangling_ids[offset : offset + 50]
+    container_ids = container_output.split()
+    for offset in range(0, len(container_ids), 50):
+        output = await _run_docker_command(
+            docker_command
+            + [
+                "container", "inspect", "--format", "{{.Image}}",
+                *container_ids[offset : offset + 50],
+            ],
+            timeout=DOCKER_PRESENCE_TIMEOUT_SECONDS,
+        )
+        protected_ids.update(line.strip() for line in output.splitlines() if line.strip())
+
+    list_output = await _run_docker_command(
+        docker_command + ["image", "ls", "--all", "--quiet", "--no-trunc"],
+        timeout=DOCKER_PRESENCE_TIMEOUT_SECONDS,
+    )
+    candidate_ids = list(
+        dict.fromkeys(
+            image_id for image_id in list_output.split() if image_id not in protected_ids
+        )
+    )
+    matching_images: list[str] = []
+    for offset in range(0, len(candidate_ids), 50):
+        image_ids = candidate_ids[offset : offset + 50]
         inspect_output = await _run_docker_command(
             [
                 "docker",
@@ -353,33 +384,47 @@ async def _dangling_image_ids_for_compose(
                 "image",
                 "inspect",
                 "--format",
-                "{{.Id}}\t{{json .RepoDigests}}\t{{json .Config.Labels}}",
+                "{{.Id}}\t{{json .RepoTags}}\t{{json .RepoDigests}}\t{{json .Config.Labels}}",
                 *image_ids,
             ],
             timeout=DOCKER_PRESENCE_TIMEOUT_SECONDS,
         )
         for line in inspect_output.splitlines():
-            fields = line.split("\t", 2)
-            if len(fields) != 3:
+            fields = line.split("\t", 3)
+            if len(fields) != 4:
                 continue
-            image_id, raw_digests, raw_labels = fields
+            image_id, raw_tags, raw_digests, raw_labels = fields
+            if image_id in protected_ids:
+                continue
             try:
+                tags = json.loads(raw_tags) or []
                 digests = json.loads(raw_digests)
                 labels = json.loads(raw_labels)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(tags, list):
                 continue
             is_project_image = (
                 isinstance(labels, dict)
                 and labels.get("com.docker.compose.project") == project_name
             )
+            matching_tags = [
+                tag
+                for tag in tags
+                if isinstance(tag, str)
+                and (is_project_image or _normalize_image_repository(tag) in image_repositories)
+            ]
             is_configured_image = isinstance(digests, list) and any(
                 isinstance(digest, str)
                 and _normalize_image_repository(digest) in image_repositories
                 for digest in digests
             )
-            if is_project_image or is_configured_image:
-                matching_ids.append(image_id)
-    return matching_ids
+            if matching_tags:
+                # Remove tags explicitly: deleting by ID fails for multiply tagged images.
+                matching_images.extend(matching_tags)
+            elif not tags and (is_project_image or is_configured_image):
+                matching_images.append(image_id)
+    return list(dict.fromkeys(matching_images))
 
 
 async def _target_container_uptime_seconds() -> float | None:
@@ -1083,7 +1128,7 @@ def _add_commands(client: ControlClient) -> None:
 
     @client.tree.command(
         name="prune",
-        description="Delete old dangling images from facebed's Compose project.",
+        description="Delete unused old versions of all images in the Compose config.",
         guild=guild,
     )
     async def prune(interaction: discord.Interaction) -> None:
@@ -1097,15 +1142,15 @@ def _add_commands(client: ControlClient) -> None:
             except HostCommandError as exc:
                 details = _format_code_block(exc.output or str(exc))
                 await interaction.edit_original_response(
-                    content=f"Could not prune dangling images for the Compose project.\n{details}",
+                    content=f"Could not prune old images for the Compose project.\n{details}",
                     allowed_mentions=NO_MENTIONS,
                 )
                 return
 
-            result = output or "No dangling images were removed."
+            result = output or "No old images were removed."
             await interaction.edit_original_response(
                 content=(
-                    f"Dangling images for Compose project `{project_name}` pruned.\n"
+                    f"Old images for Compose project `{project_name}` pruned.\n"
                     f"{_format_code_block(result)}"
                 ),
                 allowed_mentions=NO_MENTIONS,
